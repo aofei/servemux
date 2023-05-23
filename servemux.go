@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	stdpath "path"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -49,6 +50,10 @@ type ServeMux struct {
 
 // NewServeMux allocates and returns a new ServeMux.
 func NewServeMux() *ServeMux { return new(ServeMux) }
+
+// serveMuxPathVarNameRE is used to match valid path variable name for the
+// [ServeMux.Handle].
+var serveMuxPathVarNameRE = regexp.MustCompile(`^[_\pL][_\pL\p{Nd}]*$`)
 
 // Handle registers the handler for the given pattern. If a handler already
 // exists for pattern, Handle panics.
@@ -158,6 +163,9 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 		}
 
 		if pathVarName != "" {
+			if !serveMuxPathVarNameRE.MatchString(pathVarName) {
+				panic("http.ServeMux: a path variable name in pattern must be either empty or a valid Go identifier")
+			}
 			for _, pvn := range pathVarNames {
 				if pvn == pathVarName {
 					panic("http.ServeMux: pattern path cannot have duplicate variable names")
