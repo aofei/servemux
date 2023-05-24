@@ -460,11 +460,29 @@ var (
 		{"PUT", "/1/roles/{objectId}"},
 		{"PUT", "/1/users/{objectId}"},
 	}
+
+	connectRoutes = []*route{
+		{"CONNECT", "example.com/foo/bar/"},
+		{"CONNECT", "example.com/foo/bar"},
+		{"CONNECT", "example.com/foobar/"},
+		{"CONNECT", "example.com/foobar"},
+		{"CONNECT", "example.com"},
+		{"CONNECT", "example.org/"},
+		{"CONNECT", "example.org/foobar"},
+		{"CONNECT", "example.org/foobar/"},
+		{"CONNECT", "example.org/foo/bar"},
+		{"CONNECT", "example.org/foo/bar/"},
+		{"CONNECT", "example.net:8080"},
+		{"CONNECT", "example.net:8080/foobar"},
+		{"CONNECT", "example.net:8080/foobar/"},
+		{"CONNECT", "example.net:8080/foo/bar"},
+		{"CONNECT", "example.net:8080/foo/bar/"},
+	}
 )
 
 func TestServeMux(t *testing.T) {
 	mux := NewServeMux()
-	routesGroup := [][]*route{staticRoutes, githubAPIRoutes, gplusAPIRoutes, parseAPIRoutes}
+	routesGroup := [][]*route{staticRoutes, githubAPIRoutes, gplusAPIRoutes, parseAPIRoutes, connectRoutes}
 	for _, routes := range routesGroup {
 		for _, route := range routes {
 			pattern := route.pattern()
