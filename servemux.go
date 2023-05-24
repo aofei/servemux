@@ -55,26 +55,8 @@ func NewServeMux() *ServeMux { return new(ServeMux) }
 // [ServeMux.Handle].
 var serveMuxPathVarNameRE = regexp.MustCompile(`^[_\pL][_\pL\p{Nd}]*$`)
 
-// Handle registers the handler for the given pattern. If a handler already
-// exists for pattern, Handle panics.
-//
-// ...
-func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
-	mux.mu.Lock()
-	defer mux.mu.Unlock()
-
-	if pattern == "" {
-		panic("http.ServeMux: empty pattern")
-	}
-	if handler == nil {
-		panic("http.ServeMux: nil handler")
-	}
-
-	if mux.tree == nil {
-		mux.tree = &serveMuxNode{staticChildren: make([]*serveMuxNode, 255)}
-		mux.registeredPatterns = map[string]string{}
-	}
-
+// parsePattern parses the pattern. It panics when something goes wrong.
+func (mux *ServeMux) parsePattern(pattern string) (method, path string, pathVarNames []string) {
 	method, path, ok := strings.Cut(pattern, " ")
 	if !ok {
 		path = method
@@ -96,12 +78,15 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 
 	hasTrailingSlash := path[len(path)-1] == '/'
 	path = stdpath.Clean(path)
-	if hasTrailingSlash && path != "/" {
+	if hasTrailingSlash {
+		if path == "/" {
+			path = ""
+		}
 		path += "/{...}"
 	}
 	path = strings.TrimSuffix(path, "{$}")
 	if strings.Contains(path, "{$}") {
-		panic("http.ServeMux: \"{$}\" can only appear at the end of a pattern path")
+		panic(`http.ServeMux: "{$}" can only appear at the end of a pattern path`)
 	}
 
 	if strings.Contains(path, "{") {
@@ -120,48 +105,21 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 		}
 	}
 
-	cleanPattern := method + path
-	for i := len(method); i < len(cleanPattern); i++ {
-		if cleanPattern[i] == '{' {
-			j := i + 1
-			for ; i < len(cleanPattern) && cleanPattern[i] != '}'; i++ {
-			}
-			if strings.HasSuffix(cleanPattern[j:i], "...") {
-				cleanPattern = cleanPattern[:j] + cleanPattern[i-3:]
-				i = j + 4
-			} else {
-				cleanPattern = cleanPattern[:j] + cleanPattern[i:]
-				i = j + 1
-			}
-		}
-	}
-
-	if registeredPattern, ok := mux.registeredPatterns[cleanPattern]; ok {
-		panic(fmt.Sprintf("http.ServeMux: pattern %q conflicts with %q", pattern, registeredPattern))
-	} else {
-		mux.registeredPatterns[cleanPattern] = pattern
-	}
-
-	var pathVarNames []string
 	for i := 0; i < len(path); i++ {
 		if path[i] != '{' {
 			continue
 		}
-
-		mux.insert(pattern, method, path[:i], nil, staticServeMuxNode, nil)
 
 		j := i + 1
 		for ; i < len(path) && path[i] != '}'; i++ {
 		}
 
 		pathVarName := path[j:i]
-
-		nodeType := varServeMuxNode
+		isWildcard := false
 		if strings.HasSuffix(pathVarName, "...") {
-			nodeType = wildcardVarServeMuxNode
+			isWildcard = true
 			pathVarName = strings.TrimSuffix(pathVarName, "...")
 		}
-
 		if pathVarName != "" {
 			if !serveMuxPathVarNameRE.MatchString(pathVarName) {
 				panic("http.ServeMux: a path variable name in pattern must be either empty or a valid Go identifier")
@@ -172,27 +130,77 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 				}
 			}
 		}
-
 		pathVarNames = append(pathVarNames, pathVarName)
 
-		if nodeType == wildcardVarServeMuxNode {
+		if isWildcard {
 			path = path[:j] + path[i-3:]
 			i = j + 4
 		} else {
 			path = path[:j] + path[i:]
 			i = j + 1
 		}
+	}
+
+	denamedPattern := method + " " + path
+	if registeredPattern, ok := mux.registeredPatterns[denamedPattern]; ok {
+		panic(fmt.Sprintf("http.ServeMux: pattern %q conflicts with %q", pattern, registeredPattern))
+	} else {
+		mux.registeredPatterns[denamedPattern] = pattern
+	}
+
+	return
+}
+
+// Handle registers the handler for the given pattern. If a handler already
+// exists for pattern, Handle panics.
+//
+// ...
+func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+
+	if pattern == "" {
+		panic("http.ServeMux: empty pattern")
+	}
+	if handler == nil {
+		panic("http.ServeMux: nil handler")
+	}
+
+	if mux.tree == nil {
+		mux.tree = &serveMuxNode{staticChildren: make([]*serveMuxNode, 255)}
+		mux.registeredPatterns = map[string]string{}
+	}
+
+	method, path, pathVarNames := mux.parsePattern(pattern)
+	for i, pathVarCount := 0, 0; i < len(path); i++ {
+		if path[i] != '{' {
+			continue
+		}
+		pathVarCount++
+
+		mux.insert(pattern, method, path[:i], nil, staticServeMuxNode, nil)
+
+		j := i + 1
+		for ; i < len(path) && path[i] != '}'; i++ {
+		}
+
+		nodeType := varServeMuxNode
+		if path[j:i] == "..." {
+			nodeType = wildcardVarServeMuxNode
+		}
+
+		i++
 		if i < len(path) {
-			mux.insert(pattern, method, path[:i], nil, nodeType, pathVarNames)
+			mux.insert(pattern, method, path[:i], nil, nodeType, pathVarNames[:pathVarCount])
 		} else {
-			mux.insert(pattern, method, path[:i], handler, nodeType, pathVarNames)
+			mux.insert(pattern, method, path[:i], handler, nodeType, pathVarNames[:pathVarCount])
 			if nodeType == wildcardVarServeMuxNode {
 				i = j - 1
 				if i > 1 && len(pathVarNames) == 1 {
 					method, path := "_tsr", path[:i-1]
-					cleanPattern := method + path
-					if _, ok := mux.registeredPatterns[cleanPattern]; !ok {
-						mux.registeredPatterns[cleanPattern] = pattern
+					denamedPattern := method + " " + path
+					if _, ok := mux.registeredPatterns[denamedPattern]; !ok {
+						mux.registeredPatterns[denamedPattern] = pattern
 						mux.insert(pattern, method, path, mux.tsrHandler(), staticServeMuxNode, nil)
 					}
 				}
@@ -200,7 +208,6 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 			break
 		}
 	}
-
 	mux.insert(pattern, method, path, handler, staticServeMuxNode, pathVarNames)
 }
 

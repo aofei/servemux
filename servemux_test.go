@@ -3,6 +3,7 @@ package servemux
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -20,7 +21,7 @@ func (r route) pattern() string {
 
 var (
 	staticRoutes = []*route{
-		{"GET", "/"},
+		{"GET", "/{$}"},
 		{"GET", "/Makefile"},
 		{"GET", "/articles/"},
 		{"GET", "/articles/go_command.html"},
@@ -474,7 +475,7 @@ func TestServeMux(t *testing.T) {
 	}
 	for _, routes := range routesGroup {
 		for _, route := range routes {
-			req := httptest.NewRequest(route.method, route.path, nil)
+			req := httptest.NewRequest(route.method, strings.TrimSuffix(route.path, "{$}"), nil)
 			rec := httptest.NewRecorder()
 			h, pattern := mux.Handler(req)
 			if got, want := pattern, route.pattern(); got != want {
