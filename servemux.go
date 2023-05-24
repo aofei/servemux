@@ -54,9 +54,15 @@ type ServeMux struct {
 // NewServeMux allocates and returns a new ServeMux.
 func NewServeMux() *ServeMux { return new(ServeMux) }
 
-// serveMuxPathVarNameRE is used to match valid path variable name for the
-// [ServeMux.Handle].
-var serveMuxPathVarNameRE = regexp.MustCompile(`^[_\pL][_\pL\p{Nd}]*$`)
+var (
+	// serveMuxMethodRE is used to match valid method for the
+	// [ServeMux.parsePattern].
+	serveMuxMethodRE = regexp.MustCompile(`^[0-9A-Za-z]+$`)
+
+	// serveMuxPathVarNameRE is used to match valid path variable name for
+	// the [ServeMux.parsePattern].
+	serveMuxPathVarNameRE = regexp.MustCompile(`^[_\pL][_\pL\p{Nd}]*$`)
+)
 
 // parsePattern parses the pattern. It panics when something goes wrong.
 func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pathVarNames []string) {
@@ -66,10 +72,8 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 		method = ""
 	}
 
-	for _, c := range method {
-		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
-			panic("http.ServeMux: pattern method must be alphanumeric")
-		}
+	if method != "" && !serveMuxMethodRE.MatchString(method) {
+		panic("http.ServeMux: pattern method must be alphanumeric")
 	}
 
 	if hostpath == "" {
@@ -84,6 +88,14 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 		host = hostpath
 		path = ""
 	}
+
+	if host != "" {
+		u, _ := url.Parse("http://" + host + "/")
+		if u == nil || u.Host != host {
+			panic("http.ServeMux: invalid pattern host")
+		}
+	}
+
 	if path != "" {
 		path = cleanPath(path)
 		if path[len(path)-1] == '/' {
