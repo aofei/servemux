@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	stdpath "path"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -84,13 +85,9 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 		path = ""
 	}
 	if path != "" {
-		hasTrailingSlash := path[len(path)-1] == '/'
-		path = stdpath.Clean(path)
-		if hasTrailingSlash {
-			if path == "/" {
-				path = ""
-			}
-			path += "/{...}"
+		path = cleanPath(path)
+		if path[len(path)-1] == '/' {
+			path += "{...}"
 		}
 		path = strings.TrimSuffix(path, "{$}")
 		if strings.Contains(path, "{$}") {
@@ -182,6 +179,7 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 	}
 
 	method, host, path, pathVarNames := mux.parsePattern(pattern)
+
 	tree := mux.tree
 	if host != "" {
 		tree = mux.hostTrees[host]
@@ -191,12 +189,18 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 		}
 	}
 
+	if l := len(pathVarNames); mux.maxPathVars < l {
+		mux.maxPathVars = l
+		mux.pathVarValuesPool = sync.Pool{New: func() any { return make([]string, l) }}
+	}
+
+	ht := &handlerTuple{method, pathVarNames, pattern, handler}
 	for i := 0; i < len(path); i++ {
 		if path[i] != '{' {
 			continue
 		}
 
-		mux.insert(tree, pattern, method, path[:i], nil, staticServeMuxNode, nil)
+		mux.insert(tree, staticServeMuxNode, path[:i], nil)
 
 		j := i + 1
 		for ; i < len(path) && path[i] != '}'; i++ {
@@ -209,9 +213,9 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 
 		i++
 		if i < len(path) {
-			mux.insert(tree, pattern, method, path[:i], nil, nodeType, nil)
+			mux.insert(tree, nodeType, path[:i], nil)
 		} else {
-			mux.insert(tree, pattern, method, path[:i], handler, nodeType, pathVarNames)
+			mux.insert(tree, nodeType, path, ht)
 			if nodeType == wildcardVarServeMuxNode {
 				i = j - 1
 				if i > 1 && len(pathVarNames) == 1 {
@@ -219,23 +223,22 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 					denamedPattern := method + " " + host + path
 					if _, ok := mux.registeredPatterns[denamedPattern]; !ok {
 						mux.registeredPatterns[denamedPattern] = pattern
-						mux.insert(tree, pattern, method, path, mux.tsrHandler(), staticServeMuxNode, nil)
+						mux.insert(tree, staticServeMuxNode, path, &handlerTuple{
+							method:  method,
+							pattern: pattern,
+							handler: mux.tsrHandler(),
+						})
 					}
 				}
 			}
 			break
 		}
 	}
-	mux.insert(tree, pattern, method, path, handler, staticServeMuxNode, pathVarNames)
+	mux.insert(tree, staticServeMuxNode, path, ht)
 }
 
 // insert inserts nodes into the tree.
-func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h http.Handler, nt serveMuxNodeType, pathVarNames []string) {
-	if l := len(pathVarNames); mux.maxPathVars < l {
-		mux.maxPathVars = l
-		mux.pathVarValuesPool = sync.Pool{New: func() any { return make([]string, l) }}
-	}
-
+func (mux *ServeMux) insert(tree *serveMuxNode, nt serveMuxNodeType, path string, ht *handlerTuple) {
 	var (
 		s  = path        // Search
 		sl int           // Search length
@@ -258,10 +261,9 @@ func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h 
 		}
 
 		if s == "" { // At root node
-			if h != nil {
+			if ht != nil {
 				cn.typ = nt
-				cn.pathVarNames = pathVarNames
-				cn.setHandler(method, pattern, h)
+				cn.setHandlerTuple(ht)
 			}
 		} else if ll < pl { // Split node
 			nn = &serveMuxNode{
@@ -273,9 +275,8 @@ func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h 
 				varChild:             cn.varChild,
 				wildcardVarChild:     cn.wildcardVarChild,
 				hasAtLeastOneChild:   cn.hasAtLeastOneChild,
-				pathVarNames:         cn.pathVarNames,
-				handlers:             cn.handlers,
-				catchAllHandler:      cn.catchAllHandler,
+				handlerTuples:        cn.handlerTuples,
+				catchAllHandlerTuple: cn.catchAllHandlerTuple,
 				hasAtLeastOneHandler: cn.hasAtLeastOneHandler,
 			}
 
@@ -301,17 +302,15 @@ func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h 
 			cn.varChild = nil
 			cn.wildcardVarChild = nil
 			cn.hasAtLeastOneChild = false
-			cn.pathVarNames = nil
-			cn.handlers = nil
-			cn.catchAllHandler = nil
+			cn.handlerTuples = nil
+			cn.catchAllHandlerTuple = nil
 			cn.hasAtLeastOneHandler = false
 			cn.addChild(nn)
 
 			if ll == sl { // At current node
 				cn.typ = nt
-				if h != nil {
-					cn.pathVarNames = pathVarNames
-					cn.setHandler(method, pattern, h)
+				if ht != nil {
+					cn.setHandlerTuple(ht)
 				}
 			} else { // Create child node
 				nn = &serveMuxNode{
@@ -321,9 +320,8 @@ func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h 
 					parent:         cn,
 					staticChildren: make([]*serveMuxNode, 255),
 				}
-				if h != nil {
-					nn.pathVarNames = pathVarNames
-					nn.setHandler(method, pattern, h)
+				if ht != nil {
+					nn.setHandlerTuple(ht)
 				}
 				cn.addChild(nn)
 			}
@@ -353,14 +351,12 @@ func (mux *ServeMux) insert(tree *serveMuxNode, pattern, method, path string, h 
 				parent:         cn,
 				staticChildren: make([]*serveMuxNode, 255),
 			}
-			if h != nil {
-				nn.pathVarNames = pathVarNames
-				nn.setHandler(method, pattern, h)
+			if ht != nil {
+				nn.setHandlerTuple(ht)
 			}
 			cn.addChild(nn)
-		} else if h != nil { // Node already exists
-			cn.pathVarNames = pathVarNames
-			cn.setHandler(method, pattern, h)
+		} else if ht != nil { // Node already exists
+			cn.setHandlerTuple(ht)
 		}
 
 		break
@@ -383,6 +379,24 @@ func (mux *ServeMux) HandleFunc(pattern string, handler func(http.ResponseWriter
 //
 // ...
 func (mux *ServeMux) Handler(r *http.Request) (h http.Handler, pattern string) {
+	var path string
+	if r.Method != http.MethodConnect {
+		path = cleanPath(r.URL.Path)
+	} else {
+		path = r.URL.Path
+	}
+	h, pattern = mux.handler(path, r)
+	if path != r.URL.Path {
+		u := &url.URL{Path: path, RawQuery: r.URL.RawQuery}
+		return http.RedirectHandler(u.String(), http.StatusMovedPermanently), pattern
+	}
+	return
+}
+
+// handler is the main implementation of the [mux.Handler].
+func (mux *ServeMux) handler(path string, r *http.Request) (h http.Handler, pattern string) {
+	mux.mu.RLock()
+	defer mux.mu.RUnlock()
 	if len(mux.hostTrees) > 0 {
 		var tree *serveMuxNode
 		if r.Method != http.MethodConnect {
@@ -391,26 +405,23 @@ func (mux *ServeMux) Handler(r *http.Request) (h http.Handler, pattern string) {
 			tree = mux.hostTrees[r.Host]
 		}
 		if tree != nil {
-			if h, pattern = mux.handler(tree, r); h != nil {
+			if h, pattern = mux.search(tree, path, r); h != nil {
 				return
 			}
 		}
 	}
 	if mux.tree != nil {
-		if h, pattern = mux.handler(mux.tree, r); h != nil {
+		if h, pattern = mux.search(mux.tree, path, r); h != nil {
 			return
 		}
 	}
 	return mux.notFoundHandler(), ""
 }
 
-// handler is the main implementation of the [Handler].
-func (mux *ServeMux) handler(tree *serveMuxNode, r *http.Request) (h http.Handler, pattern string) {
-	mux.mu.RLock()
-	defer mux.mu.RUnlock()
-
+// search searches the tree.
+func (mux *ServeMux) search(tree *serveMuxNode, path string, r *http.Request) (h http.Handler, pattern string) {
 	var (
-		s    = r.URL.Path     // Search
+		s    = path           // Search
 		si   int              // Search index
 		sl   int              // Search length
 		pl   int              // Prefix length
@@ -423,6 +434,7 @@ func (mux *ServeMux) handler(tree *serveMuxNode, r *http.Request) (h http.Handle
 		pvi  int              // Path variable index
 		pvvs []string         // Path variable values
 		i    int              // Index
+		ht   *handlerTuple    // Handler tuple
 	)
 
 	// Node search order: static > variable > wildcard variable.
@@ -453,7 +465,7 @@ OuterLoop:
 			if sn == nil {
 				sn = cn
 			}
-			if pattern, h = cn.handler(r.Method); h != nil {
+			if ht = cn.handlerTupleByMethod(r.Method); ht != nil {
 				break
 			}
 		}
@@ -505,7 +517,7 @@ OuterLoop:
 				sn = cn
 			}
 
-			if pattern, h = cn.handler(r.Method); h != nil {
+			if ht = cn.handlerTupleByMethod(r.Method); ht != nil {
 				break
 			}
 		}
@@ -522,7 +534,7 @@ OuterLoop:
 				si -= len(pvvs[pvi])
 			}
 
-			s = r.URL.Path[si:]
+			s = path[si:]
 		}
 
 		if cn.typ < wildcardVarServeMuxNode {
@@ -546,7 +558,7 @@ OuterLoop:
 		break
 	}
 
-	if cn == nil || h == nil {
+	if cn == nil || ht == nil {
 		if pvvs != nil {
 			//lint:ignore SA6002 this is harmless
 			mux.pathVarValuesPool.Put(pvvs)
@@ -557,9 +569,9 @@ OuterLoop:
 		return nil, ""
 	}
 
-	if len(cn.pathVarNames) > 0 {
+	if len(ht.pathVarNames) > 0 {
 		if pathVars, ok := r.Context().Value(pathVarsContextKey).(map[string]string); ok {
-			for pvi, pvn := range cn.pathVarNames {
+			for pvi, pvn := range ht.pathVarNames {
 				if pvn != "" {
 					pathVars[pvn] = pvvs[pvi]
 				}
@@ -569,7 +581,7 @@ OuterLoop:
 		mux.pathVarValuesPool.Put(pvvs)
 	}
 
-	return
+	return ht.handler, ht.pattern
 }
 
 // ServeHTTP dispatches the request to the handler whose pattern most closely
@@ -604,40 +616,25 @@ func (mux *ServeMux) methodNotAllowedHandler() http.Handler {
 // responses.
 func (mux *ServeMux) tsrHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestURI := r.RequestURI
-		if requestURI == "" {
-			requestURI = "/"
-		} else {
-			path, query := requestURI, ""
-			for i := 0; i < len(path); i++ {
-				if path[i] == '?' {
-					query = path[i:]
-					path = path[:i]
-					break
-				}
-			}
-			if path == "" || path[len(path)-1] != '/' {
-				path += "/"
-			}
-			requestURI = path + query
-		}
-		http.Redirect(w, r, requestURI, http.StatusMovedPermanently)
+		u := &url.URL{Path: r.URL.Path + "/", RawQuery: r.URL.RawQuery}
+		http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
 	})
 }
 
 // serveMuxNode is a node of the radix tree of a [ServeMux].
 type serveMuxNode struct {
-	prefix               string
-	label                byte
-	typ                  serveMuxNodeType
-	parent               *serveMuxNode
-	staticChildren       []*serveMuxNode
-	varChild             *serveMuxNode
-	wildcardVarChild     *serveMuxNode
-	hasAtLeastOneChild   bool
-	pathVarNames         []string
-	handlers             map[string]*methodHandlerPatternTuple
-	catchAllHandler      *methodHandlerPatternTuple
+	prefix string
+	label  byte
+	typ    serveMuxNodeType
+	parent *serveMuxNode
+
+	staticChildren     []*serveMuxNode
+	varChild           *serveMuxNode
+	wildcardVarChild   *serveMuxNode
+	hasAtLeastOneChild bool
+
+	handlerTuples        map[string]*handlerTuple
+	catchAllHandlerTuple *handlerTuple
 	hasAtLeastOneHandler bool
 }
 
@@ -654,40 +651,36 @@ func (mn *serveMuxNode) addChild(n *serveMuxNode) {
 	mn.hasAtLeastOneChild = true
 }
 
-// handler returns a pattern and [http.Handler] in the mn for the method. It
-// returns "", nil if not found.
-func (mn *serveMuxNode) handler(method string) (pattern string, h http.Handler) {
-	if h := mn.handlers[method]; h != nil {
-		return h.pattern, h.handler
+// handlerTupleByMethod returns a [handlerTuple] in the mn for the method. It
+// returns nil if not found.
+func (mn *serveMuxNode) handlerTupleByMethod(method string) *handlerTuple {
+	if ht := mn.handlerTuples[method]; ht != nil {
+		return ht
 	}
-	if mn.catchAllHandler != nil {
-		return mn.catchAllHandler.pattern, mn.catchAllHandler.handler
-	}
-	return "", nil
+	return mn.catchAllHandlerTuple
 }
 
-// setHandler sets the h with pattern to the mn based on the method.
-func (mn *serveMuxNode) setHandler(method, pattern string, h http.Handler) {
-	if mn.handlers == nil {
-		mn.handlers = map[string]*methodHandlerPatternTuple{}
+// setHandlerTuple sets the ht to the mn.
+func (mn *serveMuxNode) setHandlerTuple(ht *handlerTuple) {
+	if mn.handlerTuples == nil {
+		mn.handlerTuples = map[string]*handlerTuple{}
 	}
-	mhpt := &methodHandlerPatternTuple{method, h, pattern}
-	switch method {
+	switch ht.method {
 	case "", "_tsr":
-		if method == "_tsr" && mn.hasAtLeastOneHandler {
+		if ht.method == "_tsr" && mn.hasAtLeastOneHandler {
 			return
 		}
-		mn.catchAllHandler = mhpt
+		mn.catchAllHandlerTuple = ht
 	default:
-		mn.handlers[method] = mhpt
+		mn.handlerTuples[ht.method] = ht
 	}
-	if method != "_tsr" &&
-		len(mn.handlers) > 0 &&
-		mn.catchAllHandler != nil &&
-		mn.catchAllHandler.method == "_tsr" {
-		mn.catchAllHandler = nil
+	if ht.method != "_tsr" &&
+		len(mn.handlerTuples) > 0 &&
+		mn.catchAllHandlerTuple != nil &&
+		mn.catchAllHandlerTuple.method == "_tsr" {
+		mn.catchAllHandlerTuple = nil
 	}
-	mn.hasAtLeastOneHandler = len(mn.handlers) > 0 || mn.catchAllHandler != nil
+	mn.hasAtLeastOneHandler = len(mn.handlerTuples) > 0 || mn.catchAllHandlerTuple != nil
 }
 
 // serveMuxNodeType is a type of a [serveMuxNode].
@@ -700,11 +693,12 @@ const (
 	wildcardVarServeMuxNode
 )
 
-// methodHandlerPatternTuple is a {method,handler,pattern} tuple.
-type methodHandlerPatternTuple struct {
-	method  string
-	handler http.Handler
-	pattern string
+// handlerTuple is a handler tuple.
+type handlerTuple struct {
+	method       string
+	pathVarNames []string
+	pattern      string
+	handler      http.Handler
 }
 
 // stripHostPort returns h without any trailing ":<port>".
@@ -718,4 +712,26 @@ func stripHostPort(h string) string {
 		return h // on error, return unchanged
 	}
 	return host
+}
+
+// cleanPath returns the canonical path for p, eliminating . and .. elements.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	// path.Clean removes trailing slash except for root;
+	// put the trailing slash back if necessary.
+	if p[len(p)-1] == '/' && np != "/" {
+		// Fast path for common case of p being the string we want:
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
+	}
+	return np
 }
