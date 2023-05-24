@@ -504,6 +504,7 @@ func TestServeMux(t *testing.T) {
 	for _, routes := range routesGroup {
 		for _, route := range routes {
 			req := httptest.NewRequest(route.method, strings.TrimSuffix(route.path, "{$}"), nil)
+			req = ConfigureRequestToStorePathVars(req)
 			rec := httptest.NewRecorder()
 			h, pattern := mux.Handler(req)
 			if got, want := pattern, route.pattern(); got != want {
@@ -517,6 +518,38 @@ func TestServeMux(t *testing.T) {
 			mux.ServeHTTP(rec, req)
 			if got, want := rec.Body.String(), route.pattern(); got != want {
 				t.Errorf("got %q, want %q", got, want)
+			}
+			var pathVarNames []string
+			for i, path := 0, strings.TrimSuffix(route.path, "{$}"); i < len(path); i++ {
+				if path[i] != '{' {
+					continue
+				}
+
+				j := i + 1
+				for ; i < len(path) && path[i] != '}'; i++ {
+				}
+
+				pathVarName := path[j:i]
+				isWildcard := false
+				if strings.HasSuffix(pathVarName, "...") {
+					isWildcard = true
+					pathVarName = strings.TrimSuffix(pathVarName, "...")
+				}
+				pathVarNames = append(pathVarNames, pathVarName)
+
+				if isWildcard {
+					path = path[:j] + path[i-3:]
+					i = j + 4
+				} else {
+					path = path[:j] + path[i:]
+					i = j + 1
+				}
+			}
+			pathVars := PathVars(req)
+			for _, pathVarName := range pathVarNames {
+				if got, want := pathVars[pathVarName], "{"+pathVarName+"}"; got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
 			}
 		}
 	}
