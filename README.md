@@ -35,9 +35,9 @@ This section declares rules that apply to individual patterns:
 6. A variable path element must be in the form of `{[name][modifier]}`, where both the name and modifier are optional.
 7. The name of a variable path element must match `^[_\pL][_\pL\p{Nd}]*$` (a Go identifier).
 8. All variable path elements within the same path must have unique names.
-9. The modifier of a variable path element can only be `...` (wildcard modifier) or `$` (ending modifier).
-10. Both the `...`-modifier and the `$`-modifier can only be used on the last path element.
-11. The `$`-modified variable path element must have no name.
+9. The modifier of a variable path element can only be `...` or `$`.
+10. A variable modified by `...` or `$` can only be the last path element.
+11. A `$`-modified variable path element must have no name.
 
 ## Pattern Registration
 

@@ -73,11 +73,11 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 	}
 
 	if method != "" && !serveMuxMethodRE.MatchString(method) {
-		panic("http.ServeMux: pattern method must be alphanumeric")
+		panic("http.ServeMux: a pattern method must be either empty or alphanumeric")
 	}
 
 	if hostpath == "" {
-		panic("http.ServeMux: pattern hostpath cannot be empty")
+		panic("http.ServeMux: a pattern must have at least one of the host or path")
 	}
 	if hostpath[0] == '/' {
 		path = hostpath
@@ -92,78 +92,81 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 	if host != "" {
 		u, _ := url.Parse("http://" + host + "/")
 		if u == nil || u.Host != host {
-			panic("http.ServeMux: invalid pattern host")
+			panic(`http.ServeMux: a pattern host must be able to be parsed using net/url.Parse("http://" + host + "/")`)
 		}
 	}
 
 	if path != "" {
-		path = cleanPath(path)
 		if path[len(path)-1] == '/' {
 			path += "{...}"
 		}
-		path = strings.TrimSuffix(path, "{$}")
-		if strings.Contains(path, "{$}") {
-			panic(`http.ServeMux: "{$}" can only appear at the end of a pattern path`)
-		}
-
-		if strings.Contains(path, "{") {
-			for _, p := range strings.Split(path, "/") {
-				if strings.Count(p, "{") > 1 {
-					panic("http.ServeMux: only one variable is allowed in a single path element of pattern")
-				}
-				if len(p) > 0 && p[0] == '{' && p[len(p)-1] != '}' {
-					panic("http.ServeMux: a path element of pattern must either be a variable or not")
-				}
-			}
-			if c := strings.Count(path, "...}"); c > 1 {
-				panic("http.ServeMux: only one wildcard variable is allowed in a pattern path")
-			} else if c == 1 && !strings.HasSuffix(path, "...}") {
-				panic("http.ServeMux: wildcard variable can only appear at the end of a pattern path")
-			}
-		}
-
 		for i := 0; i < len(path); i++ {
-			if path[i] != '{' {
+			if path[i] == '/' {
 				continue
 			}
-
-			j := i + 1
-			for ; i < len(path) && path[i] != '}'; i++ {
+			j := i
+			for ; i < len(path) && path[i] != '/'; i++ {
 			}
 
-			pathVarName := path[j:i]
-			isWildcard := false
-			if strings.HasSuffix(pathVarName, "...") {
-				isWildcard = true
-				pathVarName = strings.TrimSuffix(pathVarName, "...")
+			pathElem := path[j:i]
+			if fc, lc := pathElem[0], pathElem[len(pathElem)-1]; fc != '{' && lc != '}' {
+				continue
+			} else if (fc == '{') != (lc == '}') {
+				panic("http.ServeMux: each path element in a pattern path must either be a variable or not")
 			}
+
+			pathVar := pathElem[1 : len(pathElem)-1]
+			k := strings.IndexAny(pathVar, ".$")
+			if k == -1 {
+				k = len(pathVar)
+			}
+
+			pathVarName := pathVar[:k]
 			if pathVarName != "" {
 				if !serveMuxPathVarNameRE.MatchString(pathVarName) {
-					panic("http.ServeMux: a path variable name in pattern must be either empty or a valid Go identifier")
+					panic("http.ServeMux: the name of a variable path element in a pattern path must be either empty or a Go identifier")
 				}
 				for _, pvn := range pathVarNames {
 					if pvn == pathVarName {
-						panic("http.ServeMux: pattern path cannot have duplicate variable names")
+						panic("http.ServeMux: all variable path elements within the same pattern path must have unique names")
 					}
 				}
 			}
 			pathVarNames = append(pathVarNames, pathVarName)
 
-			if isWildcard {
-				path = path[:j] + path[i-3:]
-				i = j + 4
-			} else {
-				path = path[:j] + path[i:]
-				i = j + 1
+			pathVarModifier := pathVar[k:]
+			switch pathVarModifier {
+			case "":
+			case "...":
+				if i != len(path) {
+					panic("http.ServeMux: a ...-modified variable can only be the last path element in a pattern path")
+				}
+			case "$":
+				if i != len(path) {
+					panic("http.ServeMux: a $-modified variable can only be the last path element in a pattern path")
+				}
+				if pathVarName != "" {
+					panic("http.ServeMux: a $-modified variable path element in a pattern path must have no name")
+				}
+				pathVarNames = pathVarNames[:len(pathVarNames)-1]
+				path = path[:j]
+				i = j
+				continue
+			default:
+				panic("http.ServeMux: the modifier of a variable path element in a pattern path can only be ... or $")
 			}
+
+			denamedPathElement := "{" + pathVarModifier + "}"
+			path = path[:j] + denamedPathElement + path[i:]
+			i = j + len(denamedPathElement)
 		}
 	}
 
-	denamedPattern := method + " " + host + path
-	if registeredPattern, ok := mux.registeredPatterns[denamedPattern]; ok {
+	cleanPattern := method + " " + host + path
+	if registeredPattern, ok := mux.registeredPatterns[cleanPattern]; ok {
 		panic(fmt.Sprintf("http.ServeMux: pattern %q conflicts with %q", pattern, registeredPattern))
 	} else {
-		mux.registeredPatterns[denamedPattern] = pattern
+		mux.registeredPatterns[cleanPattern] = pattern
 	}
 
 	return
@@ -185,7 +188,7 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 	}
 
 	if mux.tree == nil {
-		mux.tree = &serveMuxNode{staticChildren: make([]*serveMuxNode, 255)}
+		mux.tree = &serveMuxNode{nonvarChildren: make([]*serveMuxNode, 255)}
 		mux.hostTrees = map[string]*serveMuxNode{}
 		mux.registeredPatterns = map[string]string{}
 	}
@@ -196,7 +199,7 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 	if host != "" {
 		tree = mux.hostTrees[host]
 		if tree == nil {
-			tree = &serveMuxNode{staticChildren: make([]*serveMuxNode, 255)}
+			tree = &serveMuxNode{nonvarChildren: make([]*serveMuxNode, 255)}
 			mux.hostTrees[host] = tree
 		}
 	}
@@ -208,45 +211,47 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 
 	ht := &handlerTuple{method, pathVarNames, pattern, handler}
 	for i := 0; i < len(path); i++ {
-		if path[i] != '{' {
+		if path[i] == '/' {
+			continue
+		}
+		j := i
+		for ; i < len(path) && path[i] != '/'; i++ {
+		}
+
+		pathElem := path[j:i]
+		if pathElem[0] != '{' {
 			continue
 		}
 
-		mux.insert(tree, staticServeMuxNode, path[:i], nil)
+		mux.insert(tree, nonvarServeMuxNode, path[:j], nil)
 
-		j := i + 1
-		for ; i < len(path) && path[i] != '}'; i++ {
+		nodeType := unmodifiedVarServeMuxNode
+		if pathElem == "{...}" {
+			nodeType = ellipsisModifiedVarServeMuxNode
 		}
 
-		nodeType := varServeMuxNode
-		if path[j:i] == "..." {
-			nodeType = wildcardVarServeMuxNode
-		}
-
-		i++
 		if i < len(path) {
 			mux.insert(tree, nodeType, path[:i], nil)
 		} else {
 			mux.insert(tree, nodeType, path, ht)
-			if nodeType == wildcardVarServeMuxNode {
-				i = j - 1
-				if i > 1 && len(pathVarNames) == 1 {
-					method, path := "_tsr", path[:i-1]
-					denamedPattern := method + " " + host + path
-					if _, ok := mux.registeredPatterns[denamedPattern]; !ok {
-						mux.registeredPatterns[denamedPattern] = pattern
-						mux.insert(tree, staticServeMuxNode, path, &handlerTuple{
-							method:  method,
-							pattern: pattern,
-							handler: mux.tsrHandler(),
-						})
-					}
+			if nodeType == ellipsisModifiedVarServeMuxNode &&
+				len(pathVarNames) == 1 &&
+				strings.ReplaceAll(path[:j-1], "/", "") != "" {
+				method, path := "_tsr", path[:j-1]
+				cleanPattern := method + " " + host + path
+				if _, ok := mux.registeredPatterns[cleanPattern]; !ok {
+					mux.registeredPatterns[cleanPattern] = pattern
+					mux.insert(tree, nonvarServeMuxNode, path, &handlerTuple{
+						method:  method,
+						pattern: pattern,
+						handler: mux.tsrHandler(),
+					})
 				}
 			}
 			break
 		}
 	}
-	mux.insert(tree, staticServeMuxNode, path, ht)
+	mux.insert(tree, nonvarServeMuxNode, path, ht)
 }
 
 // insert inserts nodes into the tree.
@@ -279,40 +284,40 @@ func (mux *ServeMux) insert(tree *serveMuxNode, nt serveMuxNodeType, path string
 			}
 		} else if ll < pl { // Split node
 			nn = &serveMuxNode{
-				prefix:               cn.prefix[ll:],
-				label:                cn.prefix[ll],
-				typ:                  cn.typ,
-				parent:               cn,
-				staticChildren:       cn.staticChildren,
-				varChild:             cn.varChild,
-				wildcardVarChild:     cn.wildcardVarChild,
-				hasAtLeastOneChild:   cn.hasAtLeastOneChild,
-				handlerTuples:        cn.handlerTuples,
-				catchAllHandlerTuple: cn.catchAllHandlerTuple,
-				hasAtLeastOneHandler: cn.hasAtLeastOneHandler,
+				prefix:                   cn.prefix[ll:],
+				label:                    cn.prefix[ll],
+				typ:                      cn.typ,
+				parent:                   cn,
+				nonvarChildren:           cn.nonvarChildren,
+				unmodifiedVarChild:       cn.unmodifiedVarChild,
+				ellipsisModifiedVarChild: cn.ellipsisModifiedVarChild,
+				hasAtLeastOneChild:       cn.hasAtLeastOneChild,
+				handlerTuples:            cn.handlerTuples,
+				catchAllHandlerTuple:     cn.catchAllHandlerTuple,
+				hasAtLeastOneHandler:     cn.hasAtLeastOneHandler,
 			}
 
-			for _, n := range nn.staticChildren {
+			for _, n := range nn.nonvarChildren {
 				if n != nil {
 					n.parent = nn
 				}
 			}
 
-			if nn.varChild != nil {
-				nn.varChild.parent = nn
+			if nn.unmodifiedVarChild != nil {
+				nn.unmodifiedVarChild.parent = nn
 			}
 
-			if nn.wildcardVarChild != nil {
-				nn.wildcardVarChild.parent = nn
+			if nn.ellipsisModifiedVarChild != nil {
+				nn.ellipsisModifiedVarChild.parent = nn
 			}
 
 			// Reset current node.
 			cn.prefix = cn.prefix[:ll]
 			cn.label = cn.prefix[0]
-			cn.typ = staticServeMuxNode
-			cn.staticChildren = make([]*serveMuxNode, 255)
-			cn.varChild = nil
-			cn.wildcardVarChild = nil
+			cn.typ = nonvarServeMuxNode
+			cn.nonvarChildren = make([]*serveMuxNode, 255)
+			cn.unmodifiedVarChild = nil
+			cn.ellipsisModifiedVarChild = nil
 			cn.hasAtLeastOneChild = false
 			cn.handlerTuples = nil
 			cn.catchAllHandlerTuple = nil
@@ -330,7 +335,7 @@ func (mux *ServeMux) insert(tree *serveMuxNode, nt serveMuxNodeType, path string
 					label:          s[ll],
 					typ:            nt,
 					parent:         cn,
-					staticChildren: make([]*serveMuxNode, 255),
+					nonvarChildren: make([]*serveMuxNode, 255),
 				}
 				if ht != nil {
 					nn.setHandlerTuple(ht)
@@ -342,11 +347,11 @@ func (mux *ServeMux) insert(tree *serveMuxNode, nt serveMuxNodeType, path string
 
 			nn = nil
 			if s[0] != '{' {
-				nn = cn.staticChildren[s[0]]
+				nn = cn.nonvarChildren[s[0]]
 			} else if s[1] == '}' {
-				nn = cn.varChild
+				nn = cn.unmodifiedVarChild
 			} else {
-				nn = cn.wildcardVarChild
+				nn = cn.ellipsisModifiedVarChild
 			}
 
 			if nn != nil {
@@ -361,7 +366,7 @@ func (mux *ServeMux) insert(tree *serveMuxNode, nt serveMuxNodeType, path string
 				label:          s[0],
 				typ:            nt,
 				parent:         cn,
-				staticChildren: make([]*serveMuxNode, 255),
+				nonvarChildren: make([]*serveMuxNode, 255),
 			}
 			if ht != nil {
 				nn.setHandlerTuple(ht)
@@ -417,21 +422,21 @@ func (mux *ServeMux) handler(path string, r *http.Request) (h http.Handler, patt
 			tree = mux.hostTrees[r.Host]
 		}
 		if tree != nil {
-			if h, pattern = mux.search(tree, path, r); h != nil {
+			if h, pattern = mux.match(tree, path, r); h != nil {
 				return
 			}
 		}
 	}
 	if mux.tree != nil {
-		if h, pattern = mux.search(mux.tree, path, r); h != nil {
+		if h, pattern = mux.match(mux.tree, path, r); h != nil {
 			return
 		}
 	}
 	return mux.notFoundHandler(), ""
 }
 
-// search searches the tree.
-func (mux *ServeMux) search(tree *serveMuxNode, path string, r *http.Request) (h http.Handler, pattern string) {
+// match finds the best match for the r from the tree.
+func (mux *ServeMux) match(tree *serveMuxNode, path string, r *http.Request) (h http.Handler, pattern string) {
 	var (
 		s    = path           // Search
 		si   int              // Search index
@@ -449,10 +454,10 @@ func (mux *ServeMux) search(tree *serveMuxNode, path string, r *http.Request) (h
 		ht   *handlerTuple    // Handler tuple
 	)
 
-	// Node search order: static > variable > wildcard variable.
+	// Node precedence: non-variable > unmodified variable > ...-modified variable.
 OuterLoop:
 	for {
-		if cn.typ == staticServeMuxNode {
+		if cn.typ == nonvarServeMuxNode {
 			sl, pl = len(s), len(cn.prefix)
 			if sl < pl {
 				ml = sl
@@ -465,7 +470,7 @@ OuterLoop:
 			}
 
 			if ll != pl {
-				fnt = staticServeMuxNode
+				fnt = nonvarServeMuxNode
 				goto BacktrackToPreviousNode
 			}
 
@@ -482,16 +487,16 @@ OuterLoop:
 			}
 		}
 
-		// Try static node.
-		if s != "" && cn.staticChildren[s[0]] != nil {
-			cn = cn.staticChildren[s[0]]
+		// Try non-variable node.
+		if s != "" && cn.nonvarChildren[s[0]] != nil {
+			cn = cn.nonvarChildren[s[0]]
 			continue OuterLoop
 		}
 
-		// Try variable node.
-	TryVarNode:
-		if cn.varChild != nil {
-			cn = cn.varChild
+		// Try unmodified variable node.
+	TryUnmodifiedVarNode:
+		if cn.unmodifiedVarChild != nil {
+			cn = cn.unmodifiedVarChild
 
 			i, sl = 0, len(s)
 			for ; i < sl && s[i] != '/'; i++ {
@@ -510,10 +515,10 @@ OuterLoop:
 			continue
 		}
 
-		// Try wildcard variable node.
-	TryWildcardVarNode:
-		if cn.wildcardVarChild != nil {
-			cn = cn.wildcardVarChild
+		// Try ...-modified variable node.
+	TryEllipsisModifiedVarNode:
+		if cn.ellipsisModifiedVarChild != nil {
+			cn = cn.ellipsisModifiedVarChild
 
 			if pvvs == nil {
 				pvvs = mux.pathVarValuesPool.Get().([]string)
@@ -534,12 +539,12 @@ OuterLoop:
 			}
 		}
 
-		fnt = wildcardVarServeMuxNode
+		fnt = ellipsisModifiedVarServeMuxNode
 
-		// Backtrack to previous node.
+		// Backtrack to the previous node.
 	BacktrackToPreviousNode:
-		if fnt != staticServeMuxNode {
-			if cn.typ == staticServeMuxNode {
+		if fnt != nonvarServeMuxNode {
+			if cn.typ == nonvarServeMuxNode {
 				si -= len(cn.prefix)
 			} else {
 				pvi--
@@ -549,21 +554,21 @@ OuterLoop:
 			s = path[si:]
 		}
 
-		if cn.typ < wildcardVarServeMuxNode {
+		if cn.typ < ellipsisModifiedVarServeMuxNode {
 			nnt = cn.typ + 1
 		} else {
-			nnt = staticServeMuxNode
+			nnt = nonvarServeMuxNode
 		}
 
 		cn = cn.parent
 		if cn != nil {
 			switch nnt {
-			case varServeMuxNode:
-				goto TryVarNode
-			case wildcardVarServeMuxNode:
-				goto TryWildcardVarNode
+			case unmodifiedVarServeMuxNode:
+				goto TryUnmodifiedVarNode
+			case ellipsisModifiedVarServeMuxNode:
+				goto TryEllipsisModifiedVarNode
 			}
-		} else if fnt == staticServeMuxNode {
+		} else if fnt == nonvarServeMuxNode {
 			sn = nil
 		}
 
@@ -640,10 +645,10 @@ type serveMuxNode struct {
 	typ    serveMuxNodeType
 	parent *serveMuxNode
 
-	staticChildren     []*serveMuxNode
-	varChild           *serveMuxNode
-	wildcardVarChild   *serveMuxNode
-	hasAtLeastOneChild bool
+	nonvarChildren           []*serveMuxNode
+	unmodifiedVarChild       *serveMuxNode
+	ellipsisModifiedVarChild *serveMuxNode
+	hasAtLeastOneChild       bool
 
 	handlerTuples        map[string]*handlerTuple
 	catchAllHandlerTuple *handlerTuple
@@ -653,12 +658,12 @@ type serveMuxNode struct {
 // addChild adds the n as a child node to the mn.
 func (mn *serveMuxNode) addChild(n *serveMuxNode) {
 	switch n.typ {
-	case staticServeMuxNode:
-		mn.staticChildren[n.label] = n
-	case varServeMuxNode:
-		mn.varChild = n
-	case wildcardVarServeMuxNode:
-		mn.wildcardVarChild = n
+	case nonvarServeMuxNode:
+		mn.nonvarChildren[n.label] = n
+	case unmodifiedVarServeMuxNode:
+		mn.unmodifiedVarChild = n
+	case ellipsisModifiedVarServeMuxNode:
+		mn.ellipsisModifiedVarChild = n
 	}
 	mn.hasAtLeastOneChild = true
 }
@@ -695,14 +700,14 @@ func (mn *serveMuxNode) setHandlerTuple(ht *handlerTuple) {
 	mn.hasAtLeastOneHandler = len(mn.handlerTuples) > 0 || mn.catchAllHandlerTuple != nil
 }
 
-// serveMuxNodeType is a type of a [serveMuxNode].
+// serveMuxNodeType is the type of a [serveMuxNode].
 type serveMuxNodeType uint8
 
 // The types of [serveMuxNode].
 const (
-	staticServeMuxNode serveMuxNodeType = iota
-	varServeMuxNode
-	wildcardVarServeMuxNode
+	nonvarServeMuxNode serveMuxNodeType = iota
+	unmodifiedVarServeMuxNode
+	ellipsisModifiedVarServeMuxNode
 )
 
 // handlerTuple is a handler tuple.
