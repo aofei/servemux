@@ -68,8 +68,7 @@ var (
 func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pathVarNames []string) {
 	method, hostpath, ok := strings.Cut(pattern, " ")
 	if !ok {
-		hostpath = method
-		method = ""
+		method, hostpath = "", method
 	}
 
 	if method != "" && !serveMuxMethodRE.MatchString(method) {
@@ -79,14 +78,10 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 	if hostpath == "" {
 		panic("http.ServeMux: a pattern must have at least one of the host or path")
 	}
-	if hostpath[0] == '/' {
-		path = hostpath
-	} else if i := strings.Index(hostpath, "/"); i > 0 {
-		host = hostpath[:i]
-		path = hostpath[i:]
+	if i := strings.Index(hostpath, "/"); i >= 0 {
+		host, path = hostpath[:i], hostpath[i:]
 	} else {
 		host = hostpath
-		path = ""
 	}
 
 	if host != "" {
@@ -100,73 +95,65 @@ func (mux *ServeMux) parsePattern(pattern string) (method, host, path string, pa
 		if path[len(path)-1] == '/' {
 			path += "{...}"
 		}
-		for i := 0; i < len(path); i++ {
-			if path[i] == '/' {
-				continue
-			}
-			j := i
-			for ; i < len(path) && path[i] != '/'; i++ {
-			}
+		var denamedPath string
+		walkPath(path, func(recentlyPassedSlashes, elem string, elemIndex int) bool {
+			denamedPath += recentlyPassedSlashes
 
-			pathElem := path[j:i]
-			if fc, lc := pathElem[0], pathElem[len(pathElem)-1]; fc != '{' && lc != '}' {
-				continue
+			if fc, lc := elem[0], elem[len(elem)-1]; fc != '{' && lc != '}' {
+				denamedPath += elem
+				return true
 			} else if (fc == '{') != (lc == '}') {
 				panic("http.ServeMux: each path element in a pattern path must either be a variable or not")
 			}
 
-			pathVar := pathElem[1 : len(pathElem)-1]
-			k := strings.IndexAny(pathVar, ".$")
-			if k == -1 {
-				k = len(pathVar)
+			varName, varModifier := elem[1:len(elem)-1], ""
+			if i := strings.IndexAny(varName, ".$"); i >= 0 {
+				varName, varModifier = varName[:i], varName[i:]
 			}
 
-			pathVarName := pathVar[:k]
-			if pathVarName != "" {
-				if !serveMuxPathVarNameRE.MatchString(pathVarName) {
+			if varName != "" {
+				if !serveMuxPathVarNameRE.MatchString(varName) {
 					panic("http.ServeMux: the name of a variable path element in a pattern path must be either empty or a Go identifier")
 				}
 				for _, pvn := range pathVarNames {
-					if pvn == pathVarName {
+					if pvn == varName {
 						panic("http.ServeMux: all variable path elements within the same pattern path must have unique names")
 					}
 				}
 			}
-			pathVarNames = append(pathVarNames, pathVarName)
+			pathVarNames = append(pathVarNames, varName)
 
-			pathVarModifier := pathVar[k:]
-			switch pathVarModifier {
+			isNotLastElem := elemIndex+len(elem) < len(path)
+			switch varModifier {
 			case "":
 			case "...":
-				if i != len(path) {
+				if isNotLastElem {
 					panic("http.ServeMux: a ...-modified variable can only be the last path element in a pattern path")
 				}
 			case "$":
-				if i != len(path) {
+				if isNotLastElem {
 					panic("http.ServeMux: a $-modified variable can only be the last path element in a pattern path")
 				}
-				if pathVarName != "" {
+				if varName != "" {
 					panic("http.ServeMux: a $-modified variable path element in a pattern path must have no name")
 				}
 				pathVarNames = pathVarNames[:len(pathVarNames)-1]
-				path = path[:j]
-				i = j
-				continue
+				return false
 			default:
 				panic("http.ServeMux: the modifier of a variable path element in a pattern path can only be ... or $")
 			}
+			denamedPath += "{" + varModifier + "}"
 
-			denamedPathElement := "{" + pathVarModifier + "}"
-			path = path[:j] + denamedPathElement + path[i:]
-			i = j + len(denamedPathElement)
-		}
+			return true
+		})
+		path = denamedPath
 	}
 
-	cleanPattern := method + " " + host + path
-	if registeredPattern, ok := mux.registeredPatterns[cleanPattern]; ok {
+	cleanedPattern := method + " " + host + path
+	if registeredPattern, ok := mux.registeredPatterns[cleanedPattern]; ok {
 		panic(fmt.Sprintf("http.ServeMux: pattern %q conflicts with %q", pattern, registeredPattern))
 	} else {
-		mux.registeredPatterns[cleanPattern] = pattern
+		mux.registeredPatterns[cleanedPattern] = pattern
 	}
 
 	return
@@ -210,37 +197,29 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 	}
 
 	ht := &handlerTuple{method, pathVarNames, pattern, handler}
-	for i := 0; i < len(path); i++ {
-		if path[i] == '/' {
-			continue
-		}
-		j := i
-		for ; i < len(path) && path[i] != '/'; i++ {
+	walkPath(path, func(_, elem string, elemIndex int) bool {
+		if elem[0] != '{' {
+			return true
 		}
 
-		pathElem := path[j:i]
-		if pathElem[0] != '{' {
-			continue
-		}
-
-		mux.insert(tree, nonvarServeMuxNode, path[:j], nil)
+		mux.insert(tree, nonvarServeMuxNode, path[:elemIndex], nil)
 
 		nodeType := unmodifiedVarServeMuxNode
-		if pathElem == "{...}" {
+		if elem == "{...}" {
 			nodeType = ellipsisModifiedVarServeMuxNode
 		}
 
-		if i < len(path) {
-			mux.insert(tree, nodeType, path[:i], nil)
+		if nextSlashIndex := elemIndex + len(elem); nextSlashIndex < len(path) {
+			mux.insert(tree, nodeType, path[:nextSlashIndex], nil)
 		} else {
 			mux.insert(tree, nodeType, path, ht)
 			if nodeType == ellipsisModifiedVarServeMuxNode &&
 				len(pathVarNames) == 1 &&
-				strings.ReplaceAll(path[:j-1], "/", "") != "" {
-				method, path := "_tsr", path[:j-1]
-				cleanPattern := method + " " + host + path
-				if _, ok := mux.registeredPatterns[cleanPattern]; !ok {
-					mux.registeredPatterns[cleanPattern] = pattern
+				strings.ReplaceAll(path[:elemIndex-1], "/", "") != "" {
+				method, path := "_tsr", path[:elemIndex-1]
+				cleanedPattern := method + " " + host + path
+				if _, ok := mux.registeredPatterns[cleanedPattern]; !ok {
+					mux.registeredPatterns[cleanedPattern] = pattern
 					mux.insert(tree, nonvarServeMuxNode, path, &handlerTuple{
 						method:  method,
 						pattern: pattern,
@@ -248,9 +227,11 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 					})
 				}
 			}
-			break
+			return false
 		}
-	}
+
+		return true
+	})
 	mux.insert(tree, nonvarServeMuxNode, path, ht)
 }
 
@@ -751,4 +732,26 @@ func cleanPath(p string) string {
 		}
 	}
 	return np
+}
+
+// walkPath walks the given path and calls the f for each passed path element.
+// If the f returns false, the walk stops.
+func walkPath(path string, f func(recentlyPassedSlashes, elem string, elemIndex int) bool) {
+	var recentlyPassedSlashes string
+	for i := 0; i < len(path); i++ {
+		if path[i] == '/' {
+			recentlyPassedSlashes += "/"
+			continue
+		}
+		j := i
+		for ; i < len(path) && path[i] != '/'; i++ {
+		}
+		elem := path[j:i]
+		if !f(recentlyPassedSlashes, elem, j) {
+			break
+		}
+		if i < len(path) {
+			recentlyPassedSlashes = "/"
+		}
+	}
 }
