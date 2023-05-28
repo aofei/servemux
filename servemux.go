@@ -211,26 +211,31 @@ func (mux *ServeMux) Handle(pattern string, handler http.Handler) {
 
 		if nextSlashIndex := elemIndex + len(elem); nextSlashIndex < len(path) {
 			mux.insert(tree, nodeType, path[:nextSlashIndex], nil)
-		} else {
-			mux.insert(tree, nodeType, path, ht)
-			if nodeType == ellipsisModifiedVarServeMuxNode &&
-				len(pathVarNames) == 1 &&
-				strings.ReplaceAll(path[:elemIndex-1], "/", "") != "" {
-				method, path := "_tsr", path[:elemIndex-1]
-				cleanedPattern := method + " " + host + path
-				if _, ok := mux.registeredPatterns[cleanedPattern]; !ok {
-					mux.registeredPatterns[cleanedPattern] = pattern
-					mux.insert(tree, nonvarServeMuxNode, path, &handlerTuple{
-						method:  method,
-						pattern: pattern,
-						handler: mux.tsrHandler(),
-					})
-				}
-			}
-			return false
+			return true
 		}
 
-		return true
+		mux.insert(tree, nodeType, path, ht)
+
+		// For patterns like "/subtree/{...}", we may need to redirect
+		// request paths like "/subtree" to "/subtree/".
+		if path := strings.TrimRight(path[:elemIndex-1], "/"); path != "" &&
+			nodeType == ellipsisModifiedVarServeMuxNode && len(pathVarNames) == 1 {
+			method := "_tsr"
+			cleanedPattern := method + " " + host + path
+			if _, ok := mux.registeredPatterns[cleanedPattern]; !ok {
+				mux.registeredPatterns[cleanedPattern] = pattern
+				mux.insert(tree, nonvarServeMuxNode, path, &handlerTuple{
+					method:  method,
+					pattern: pattern,
+					handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						u := &url.URL{Path: r.URL.Path + "/", RawQuery: r.URL.RawQuery}
+						http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
+					}),
+				})
+			}
+		}
+
+		return false
 	})
 	mux.insert(tree, nonvarServeMuxNode, path, ht)
 }
@@ -607,15 +612,6 @@ func (mux *ServeMux) notFoundHandler() http.Handler {
 func (mux *ServeMux) methodNotAllowedHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
-	})
-}
-
-// tsrHandler returns an [http.Handler] to write TSR (Trailing Slash Redirect)
-// responses.
-func (mux *ServeMux) tsrHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u := &url.URL{Path: r.URL.Path + "/", RawQuery: r.URL.RawQuery}
-		http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
 	})
 }
 
